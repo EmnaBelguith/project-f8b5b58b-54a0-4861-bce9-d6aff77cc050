@@ -1,0 +1,101 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Permet le déclenchement manuel
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Build and push Docker image
+      run: |
+        echo "--- Contenu du Dockerfile utilisé pour le build ---"
+        cat Dockerfile
+        echo "---------------------------------------------------"
+        docker build -t ${{ secrets.DOCKER_USERNAME }}/project-f8b5b58b-54a0-4861-bce9-d6aff77cc050:latest .
+        docker push ${{ secrets.DOCKER_USERNAME }}/project-f8b5b58b-54a0-4861-bce9-d6aff77cc050:latest
+
+    - name: Debug Docker image contents
+      run: |
+        echo "--- Contenu de /app dans l'image construite ---"
+        docker run --rm ${{ secrets.DOCKER_USERNAME }}/project-f8b5b58b-54a0-4861-bce9-d6aff77cc050:latest ls -R /app
+        echo "------------------------------------------"
+
+  deploy-and-health-check:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+
+    steps:
+      - name: Pull Docker image
+        run: |
+          docker pull ${{ secrets.DOCKER_USERNAME }}/project-f8b5b58b-54a0-4861-bce9-d6aff77cc050:latest
+          echo "Image ${{ secrets.DOCKER_USERNAME }}/project-f8b5b58b-54a0-4861-bce9-d6aff77cc050:latest pulled successfully."
+
+      - name: Run Docker container
+        id: run_container
+        run: |
+          set -x 
+          docker run -d --name my-app -p 5000:5000 ${{ secrets.DOCKER_USERNAME }}/project-f8b5b58b-54a0-4861-bce9-d6aff77cc050:latest
+          echo "Conteneur 'my-app' démarré sur le port 5000 du runner (mappé au port 5000 du conteneur)."
+          echo "container_id=$(docker ps -aqf "name=my-app")" >> $GITHUB_OUTPUT
+          sleep 10 
+          echo "--- Début des logs du conteneur '''my-app''' (après 10s) ---"
+          docker logs my-app
+          echo "--- Fin des logs du conteneur '''my-app''' ---"
+          echo "--- Docker ps -a (all containers) ---"
+          docker ps -a
+          echo "-------------------------------------"
+          echo "--- Docker inspect my-app ---"
+          docker inspect my-app
+          echo "-------------------------------"
+          echo "--- Netstat inside container (requires net-tools/iproute2) ---"
+          docker exec my-app sh -c "apt-get update >/dev/null 2>&1 && apt-get install -y net-tools >/dev/null 2>&1 || echo 'net-tools not available, skipping netstat'" 
+          docker exec my-app netstat -tulnp || echo 'netstat failed, perhaps not installed or app not running'
+          echo "--- Processes inside container (ps aux) ---"
+          echo "Skipping ps aux as it might not be available in slim image."
+          echo "-------------------------------------------"
+          # DEBUGGING INFO END
+          set +x 
+
+      - name: Health Check and Generic Test
+        run: |
+          set -x
+          echo "--- Démarrage de l'étape de Health Check (tentative unique et directe) ---"
+          HEALTH_URL="http://localhost:5000/"
+          echo "Tentative de connexion à l'application sur : $HEALTH_URL"
+          curl -v $HEALTH_URL
+          CURL_EXIT_CODE=$?
+          echo "Code de sortie de curl: $CURL_EXIT_CODE"
+          if [[ "$CURL_EXIT_CODE" -eq 0 ]]; then
+            echo "Health check réussi ! Application saine (statut HTTP 2xx)."
+            exit 0
+          else
+            echo "Health check échoué. L'application n'a pas répondu avec un statut 2xx ou il y a eu une erreur de connexion."
+            echo "--- Logs finaux du conteneur 'my-app' après échec du Health Check ---"
+            docker logs my-app
+            echo "----------------------------------------------------------------------"
+            exit 1
+          fi
+
+      - name: Clean up Docker container
+        if: always()
+        run: |
+          echo "Arrêt et suppression du conteneur 'my-app'..."
+          docker stop my-app || true 
+          docker rm my-app || true
+          echo "Conteneur nettoyé."
